@@ -464,6 +464,19 @@ func dirSize(p string) int64 {
 	return n
 }
 
+// sameLib reports whether two library paths identify the same directory,
+// resolving symlinks when possible and falling back to lexical compare
+// (EvalSymlinks errors on missing paths and must never make distinct
+// paths compare equal).
+func sameLib(a, b string) bool {
+	if ra, err := filepath.EvalSymlinks(a); err == nil && ra != "" {
+		if rb, err := filepath.EvalSymlinks(b); err == nil && rb != "" {
+			return ra == rb
+		}
+	}
+	return filepath.Clean(a) == filepath.Clean(b)
+}
+
 // MoveProgress is a live snapshot of the rsync copy phase.
 type MoveProgress struct {
 	Done     int64         // bytes transferred so far
@@ -733,13 +746,94 @@ func moveWithContext(ctx context.Context, o Options, appid, targetInput string, 
 	}
 	fmt.Println("[steam-ctl] Moving manifest...")
 	if err := os.Rename(srcManifest, dstManifest); err != nil {
-		return fmt.Errorf("failed to move manifest: %w", err)
+		return fmt.Errorf("failed to move manifest (game files are in %s, manifest still in %s): %w", target, source, err)
+	}
+	if _, err := os.Stat(dstManifest); err != nil {
+		return fmt.Errorf("manifest move unverified at %s: %w", dstManifest, err)
+	}
+	if _, err := os.Stat(srcManifest); err == nil {
+		return fmt.Errorf("source manifest still present after move — aborting before library sync")
+	}
+	if err := syncVDFApps(o, appid, source, target, size); err != nil {
+		return fmt.Errorf("files+moved but library mapping failed (manifest is at %s): %w", dstManifest, err)
 	}
 	fmt.Printf("[ok] Move complete. Compatdata preserved: %s\n", cp)
 	if sh := shaderLibs(o, appid); len(sh) > 0 {
 		fmt.Printf("[ok] Shadercache preserved: %s\n", filepath.Join(sh[0], "steamapps", "shadercache", appid))
 	}
 	fmt.Println("[steam-ctl] Reopen Steam — game will appear in new library.")
+	return nil
+}
+
+// syncVDFApps updates the libraryfolders.vdf "apps" mapping after a move or
+// uninstall: drops appid from fromLib's section and, unless toLib is empty
+// (uninstall), records it under toLib with the given size. A timestamped
+// backup is written first. Without this Steam keeps pointing at the old
+// library and may redownload the game there.
+func syncVDFApps(o Options, appid, fromLib, toLib string, size int64) error {
+	data, err := os.ReadFile(o.LibraryVDF)
+	if err != nil {
+		return fmt.Errorf("read vdf: %w", err)
+	}
+	bak := fmt.Sprintf("%s.bak.%d", o.LibraryVDF, time.Now().Unix())
+	if err := os.WriteFile(bak, data, 0o644); err != nil {
+		return fmt.Errorf("backup vdf: %w", err)
+	}
+	text := string(data)
+	blockRe := regexp.MustCompile(`(?s)(\n\t)"(\d+)"\n\t\{(.*?)\n\t\}`)
+	matches := blockRe.FindAllStringSubmatchIndex(text, -1)
+	if len(matches) == 0 {
+		return fmt.Errorf("no library blocks found in vdf")
+	}
+	entryRe := regexp.MustCompile(`\t\t\t"` + regexp.QuoteMeta(appid) + `"\t\t"[0-9]+"\n`)
+	moved, removed := false, false
+	var out strings.Builder
+	prev := 0
+	for _, m := range matches {
+		body := text[m[6]:m[7]]
+		prefix := text[m[0]:m[6]] // `\n\t"N"\n\t{` header
+		suffix := text[m[7]:m[1]] // `\n\t}` tail
+		out.WriteString(text[prev:m[0]])
+		// which library is this block?
+		if pm := vdfPathRe.FindStringSubmatch(body); pm != nil {
+			if sameLib(pm[1], fromLib) {
+				if entryRe.MatchString(body) {
+					body = entryRe.ReplaceAllString(body, "")
+					removed = true
+				}
+			} else if toLib != "" && sameLib(pm[1], toLib) {
+				if !strings.Contains(body, `"`+appid+`"`) {
+					// body ends `..."\n\t\t}` (closing brace has no
+					// trailing newline inside the capture); insert the new
+					// entry just before it.
+					anchor := "\t\t}"
+					idx := strings.LastIndex(body, anchor)
+					if idx < 0 {
+						return fmt.Errorf("malformed apps section in vdf")
+					}
+					body = body[:idx] + fmt.Sprintf("\t\t\t\"%s\"\t\t\"%d\"\n", appid, size) + body[idx:]
+					moved = true
+				} else {
+					moved = true
+				}
+			}
+		}
+		out.WriteString(prefix)
+		out.WriteString(body)
+		out.WriteString(suffix)
+		prev = m[1]
+	}
+	out.WriteString(text[prev:])
+	if !removed {
+		return fmt.Errorf("appid %s not mapped under %s (vdf left untouched, backup kept)", appid, fromLib)
+	}
+	if toLib != "" && !moved {
+		return fmt.Errorf("target library block not found in vdf")
+	}
+	if err := os.WriteFile(o.LibraryVDF, []byte(out.String()), 0o644); err != nil {
+		return fmt.Errorf("write vdf: %w", err)
+	}
+	fmt.Printf("[ok] Library mapping updated (backup: %s)\n", bak)
 	return nil
 }
 
@@ -817,6 +911,9 @@ func cmdUninstall(o Options, appid string) error {
 	if _, err := os.Stat(manifest); err == nil {
 		_ = os.Remove(manifest)
 		fmt.Printf("[ok] Deleted appmanifest_%s.acf\n", appid)
+		if err := syncVDFApps(o, appid, source, "", 0); err != nil {
+			fmt.Fprintf(os.Stderr, "[warn] library mapping sync: %v\n", err)
+		}
 	}
 	if o.PurgeCompat {
 		if _, err := os.Stat(cp); err == nil {

@@ -173,11 +173,11 @@ func TestRealDataSanity(t *testing.T) {
 	}
 	found := false
 	for _, a := range apps {
-		if a.AppID == "230410" && a.Name == "Warframe" && a.ShortLib == "Home" && a.HasPrefix {
+		if a.AppID == "230410" && a.Name == "Warframe" && a.ShortLib == "External" && a.HasPrefix {
 			found = true
 		}
 	}
 	if !found {
-		t.Fatalf("expected Warframe/Home/prefix in scan (%d apps)", len(apps))
+		t.Fatalf("expected Warframe/External/prefix in scan (%d apps)", len(apps))
 	}
 }

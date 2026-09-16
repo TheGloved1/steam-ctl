@@ -8,9 +8,12 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -94,12 +97,22 @@ type model struct {
 	cur       MoveProgress
 	curName   string
 	cancel    context.CancelFunc
+	cancelMu  sync.Mutex
 	cancelled bool
 
 	listOff  int
 	fixText  string
 	fixStale bool
 	fixDone  string
+}
+
+// doCancel is safe to call from key handlers and signal goroutines.
+func (m *model) doCancel() {
+	m.cancelMu.Lock()
+	defer m.cancelMu.Unlock()
+	if m.running && m.cancel != nil {
+		m.cancel()
+	}
 }
 
 func runTUI(o Options, mode string, preselect []string) error {
@@ -135,6 +148,17 @@ func runTUI(o Options, mode string, preselect []string) error {
 	defer tty.Close()
 	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithOutput(tty))
 	m.prog = p
+	// A killed terminal (SIGTERM/SIGHUP) must cancel the in-flight copy
+	// instead of orphaning rsync mid-move — orphaned copies were the
+	// cause of duplicated installs.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGHUP)
+	go func() {
+		for range sigCh {
+			m.doCancel()
+		}
+	}()
+	defer signal.Stop(sigCh)
 	_, err = p.Run()
 	return err
 }
@@ -294,9 +318,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case scRun:
 		switch strings.ToLower(k) {
 		case "esc", "q", "ctrl+c":
-			if m.running && m.cancel != nil {
-				m.cancel()
-			}
+			m.doCancel()
 		}
 		return m, nil
 	}
@@ -348,7 +370,9 @@ func (m *model) resetBatch() {
 	m.runErr = ""
 	m.cur = MoveProgress{}
 	m.curName = ""
+	m.cancelMu.Lock()
 	m.cancel = nil
+	m.cancelMu.Unlock()
 	m.cancelled = false
 	m.refilter()
 }
@@ -514,7 +538,9 @@ func (m *model) runNext() tea.Cmd {
 	m.cur = MoveProgress{}
 	m.curName = name
 	ctx, cancel := context.WithCancel(context.Background())
+	m.cancelMu.Lock()
 	m.cancel = cancel
+	m.cancelMu.Unlock()
 	send := func(p MoveProgress) {
 		if m.prog != nil {
 			m.prog.Send(progMsg{p})
