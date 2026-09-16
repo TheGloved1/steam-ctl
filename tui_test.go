@@ -115,6 +115,40 @@ func TestConfirmStartsRunDry(t *testing.T) {
 	}
 }
 
+func TestRunViewProgressAndCancel(t *testing.T) {
+	m := testModel()
+	if len(m.apps) == 0 {
+		t.Skip("no steam libraries found")
+	}
+	m.mode = "move"
+	m.queue = []string{m.apps[0].AppID, m.apps[1].AppID}
+	m.curName = m.apps[0].Name
+	m.cur = MoveProgress{Done: 1024 * 1024, Total: 4 * 1024 * 1024, SpeedBps: 2 * 1024 * 1024, ETA: 90 * 1000000000}
+	m.screen = scRun
+	m.running = true
+	v := m.viewRun()
+	for _, want := range []string{"1.0M / 4.0M", "2.0M/s", "ETA 1:30", "game 1 of 2", "esc cancel"} {
+		if !strings.Contains(v, want) {
+			t.Fatalf("run view missing %q:\n%s", want, v)
+		}
+	}
+	// progMsg updates live state
+	nm, _ := m.Update(progMsg{MoveProgress{Done: 2 * 1024 * 1024, Total: 4 * 1024 * 1024}})
+	if nm.(*model).cur.Done != 2*1024*1024 {
+		t.Fatal("progMsg not applied")
+	}
+	// esc on run screen calls cancel (must not quit the program)
+	cancelled := false
+	m.cancel = func() { cancelled = true }
+	m = keyPress(m, "esc")
+	if !cancelled {
+		t.Fatal("esc should trigger cancel during run")
+	}
+	if m.screen != scRun {
+		t.Fatal("esc should stay on run screen until op reports back")
+	}
+}
+
 func TestListAndFixViews(t *testing.T) {
 	m := testModel()
 	if len(m.apps) == 0 {

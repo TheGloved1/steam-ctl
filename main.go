@@ -1,8 +1,10 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
+	"os/signal"
 	"strings"
 )
 
@@ -191,9 +193,18 @@ func main() {
 			}
 		}
 		failed := 0
+		mctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+		defer stop()
 		for _, a := range appids {
-			if err := cmdMove(o, a, target); err != nil {
+			if mctx.Err() != nil {
+				fmt.Fprintln(os.Stderr, "[warn] Cancelled — remaining games skipped.")
+				os.Exit(130)
+			}
+			if err := moveWithContext(mctx, o, a, target, nil); err != nil {
 				fmt.Fprintf(os.Stderr, "[error] move %s: %v\n", a, err)
+				if mctx.Err() != nil {
+					os.Exit(130)
+				}
 				failed++
 			}
 		}

@@ -4,6 +4,7 @@ package main
 // confirm → steam check → batch run with progress. No gum/fzf/python.
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -47,14 +48,16 @@ type targetOpt struct {
 }
 
 type opResult struct {
-	appid string
-	name  string
-	ok    bool
-	msg   string
+	appid     string
+	name      string
+	ok        bool
+	cancelled bool
+	msg       string
 }
 
 type tickMsg struct{}
 type opDoneMsg struct{ res opResult }
+type progMsg struct{ p MoveProgress }
 type steamClosedMsg struct{ err error }
 
 func tickCmd() tea.Cmd {
@@ -66,6 +69,7 @@ type model struct {
 	startMode string
 	screen    screen
 	width     int
+	prog      *tea.Program // set after NewProgram; lets copy goroutines Send progress
 
 	apps     []App
 	filtered []int
@@ -86,6 +90,11 @@ type model struct {
 	spinner int
 	running bool
 	runErr  string
+	// live copy state for the current op
+	cur       MoveProgress
+	curName   string
+	cancel    context.CancelFunc
+	cancelled bool
 
 	listOff  int
 	fixText  string
@@ -117,6 +126,7 @@ func runTUI(o Options, mode string, preselect []string) error {
 		}
 	}
 	p := tea.NewProgram(m, tea.WithAltScreen())
+	m.prog = p
 	_, err := p.Run()
 	return err
 }
@@ -209,8 +219,17 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tickCmd()
 		}
 		return m, nil
+	case progMsg:
+		m.cur = msg.p
+		return m, nil
 	case opDoneMsg:
 		m.results = append(m.results, msg.res)
+		if msg.res.cancelled {
+			m.cancelled = true
+			m.running = false
+			m.screen = scDone
+			return m, nil
+		}
 		m.qidx++
 		if m.qidx < len(m.queue) {
 			return m, m.runNext()
@@ -237,7 +256,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	k := msg.String()
-	if k == "ctrl+c" {
+	if k == "ctrl+c" && m.screen != scRun {
 		return m, tea.Quit
 	}
 	switch m.screen {
@@ -265,6 +284,12 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case scFix:
 		return m.fixKey(k)
 	case scRun:
+		switch strings.ToLower(k) {
+		case "esc", "q", "ctrl+c":
+			if m.running && m.cancel != nil {
+				m.cancel()
+			}
+		}
 		return m, nil
 	}
 	return m, nil
@@ -313,6 +338,10 @@ func (m *model) resetBatch() {
 	m.results = nil
 	m.qidx = 0
 	m.runErr = ""
+	m.cur = MoveProgress{}
+	m.curName = ""
+	m.cancel = nil
+	m.cancelled = false
 	m.refilter()
 }
 
@@ -455,6 +484,8 @@ func (m *model) startRun() tea.Cmd {
 	m.qidx = 0
 	m.results = nil
 	m.running = true
+	m.cancelled = false
+	m.cur = MoveProgress{}
 	m.screen = scRun
 	if len(m.queue) == 0 {
 		m.running = false
@@ -468,32 +499,32 @@ func (m *model) runNext() tea.Cmd {
 	o := m.opts
 	o.Force = true // already confirmed on the confirm screen
 	appid := m.queue[m.qidx]
+	name := m.appByID(appid).Name
+	if name == "" {
+		name = appid
+	}
+	m.cur = MoveProgress{}
+	m.curName = name
+	ctx, cancel := context.WithCancel(context.Background())
+	m.cancel = cancel
+	send := func(p MoveProgress) {
+		if m.prog != nil {
+			m.prog.Send(progMsg{p})
+		}
+	}
 	if m.mode == "move" {
 		target := m.targets[m.tcursor].path
 		return func() tea.Msg {
-			name := appid
-			for _, a := range m.apps {
-				if a.AppID == appid {
-					name = a.Name
-					break
-				}
-			}
-			err := withSilencedOutput(func() error { return cmdMove(o, appid, target) })
+			err := withSilencedOutput(func() error { return moveWithContext(ctx, o, appid, target, send) })
 			res := opResult{appid: appid, name: name, ok: err == nil}
 			if err != nil {
 				res.msg = err.Error()
+				res.cancelled = ctx.Err() != nil
 			}
 			return opDoneMsg{res}
 		}
 	}
 	return func() tea.Msg {
-		name := appid
-		for _, a := range m.apps {
-			if a.AppID == appid {
-				name = a.Name
-				break
-			}
-		}
 		err := withSilencedOutput(func() error { return cmdUninstall(o, appid) })
 		res := opResult{appid: appid, name: name, ok: err == nil}
 		if err != nil {
@@ -755,14 +786,27 @@ func (m *model) viewRun() string {
 		verb = "Uninstalling"
 	}
 	fr := spinFrames[m.spinner%len(spinFrames)]
-	cur := ""
-	if m.qidx < len(m.queue) {
+	cur := m.curName
+	if cur == "" && m.qidx < len(m.queue) {
 		cur = m.appByID(m.queue[m.qidx]).Name
 	}
-	b.WriteString(stTitle.Render(fmt.Sprintf("%s %s %d/%d  %s", fr, verb, m.qidx, len(m.queue), trunc(cur, 30))) + "\n")
-	b.WriteString(progressBar(m.qidx, len(m.queue), 30) + "\n\n")
-	// recent results (last 8)
-	start := max(0, len(m.results)-8)
+	b.WriteString(stTitle.Render(fmt.Sprintf("%s %s %d/%d  %s", fr, verb, m.qidx, len(m.queue), trunc(cur, 28))) + "\n")
+	if m.mode == "move" && m.cur.Total > 0 {
+		b.WriteString(byteProgressBar(m.cur, 30) + "\n")
+		stats := fmt.Sprintf("%s / %s (%.0f%%)", humanSize(m.cur.Done), humanSize(m.cur.Total), m.cur.Pct())
+		if m.cur.SpeedBps > 0 {
+			stats += fmt.Sprintf("  ·  %s/s", humanSize(int64(m.cur.SpeedBps)))
+		}
+		if m.cur.ETA > 0 {
+			stats += fmt.Sprintf("  ·  ETA %s", fmtETA(m.cur.ETA))
+		}
+		b.WriteString(stDim.Render(stats) + "\n")
+	} else {
+		b.WriteString(progressBar(m.qidx, len(m.queue), 30) + "\n")
+	}
+	b.WriteString("\n")
+	// recent results (last 6)
+	start := max(0, len(m.results)-6)
 	for _, r := range m.results[start:] {
 		if r.ok {
 			b.WriteString(stOK.Render("✓ "+r.name) + "\n")
@@ -770,7 +814,29 @@ func (m *model) viewRun() string {
 			b.WriteString(stErr.Render("✗ "+r.name+": "+r.msg) + "\n")
 		}
 	}
+	b.WriteString("\n" + stDim.Render(fmt.Sprintf("game %d of %d · esc cancel", min(m.qidx+1, len(m.queue)), len(m.queue))))
 	return stBox.Render(b.String())
+}
+
+func byteProgressBar(p MoveProgress, width int) string {
+	filled := 0
+	if p.Total > 0 {
+		filled = int(p.Done) * width / int(p.Total)
+		if filled > width {
+			filled = width
+		}
+	}
+	bar := strings.Repeat("█", filled) + strings.Repeat("░", width-filled)
+	return fmt.Sprintf("[%s]", bar)
+}
+
+func fmtETA(d time.Duration) string {
+	s := int(d.Seconds())
+	h, m, sec := s/3600, (s%3600)/60, s%60
+	if h > 0 {
+		return fmt.Sprintf("%d:%02d:%02d", h, m, sec)
+	}
+	return fmt.Sprintf("%d:%02d", m, sec)
 }
 
 func (m *model) viewDone() string {
@@ -783,8 +849,17 @@ func (m *model) viewDone() string {
 			fail++
 		}
 	}
-	if fail == 0 {
+	if fail == 0 && !m.cancelled {
 		b.WriteString(stOK.Render(fmt.Sprintf("Done — %d/%d succeeded.", ok, len(m.results))) + "\n\n")
+	} else if m.cancelled {
+		b.WriteString(stWarn.Render(fmt.Sprintf("Cancelled — %d done, %d remaining skipped.", ok, len(m.queue)-len(m.results))) + "\n")
+		b.WriteString(stDim.Render("Current game left intact in its source library; partial target removed.") + "\n\n")
+		for _, r := range m.results {
+			if !r.ok {
+				b.WriteString(stErr.Render("✗ "+r.name+" ("+r.appid+"): "+r.msg) + "\n")
+			}
+		}
+		b.WriteString("\n")
 	} else {
 		b.WriteString(stWarn.Render(fmt.Sprintf("Done — %d ok, %d failed.", ok, fail)) + "\n\n")
 		for _, r := range m.results {

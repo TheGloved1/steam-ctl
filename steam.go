@@ -2,7 +2,9 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -462,7 +464,83 @@ func dirSize(p string) int64 {
 	return n
 }
 
+// MoveProgress is a live snapshot of the rsync copy phase.
+type MoveProgress struct {
+	Done     int64         // bytes transferred so far
+	Total    int64         // total bytes (pre-scanned source size)
+	SpeedBps float64       // current throughput, 0 if unknown
+	ETA      time.Duration // 0 if unknown
+}
+
+func (p MoveProgress) Pct() float64 {
+	if p.Total <= 0 {
+		return 0
+	}
+	return float64(p.Done) / float64(p.Total) * 100
+}
+
+// rsync --info=progress2 emits lines like:
+// "  123456789  45%    7.82MB/s    0:00:10 (xfr#123, to-chk=45/100)"
+var rsyncProgRe = regexp.MustCompile(`^\s*([\d,]+)\s+(\d+)%\s+(\S+)/s\s+(\S+)`)
+
+func parseSpeed(s string) float64 {
+	mult := 1.0
+	num := s
+	switch {
+	case strings.HasSuffix(s, "GB"):
+		mult = 1024 * 1024 * 1024
+		num = strings.TrimSuffix(s, "GB")
+	case strings.HasSuffix(s, "MB"):
+		mult = 1024 * 1024
+		num = strings.TrimSuffix(s, "MB")
+	case strings.HasSuffix(s, "kB"):
+		mult = 1024
+		num = strings.TrimSuffix(s, "kB")
+	case strings.HasSuffix(s, "B"):
+		num = strings.TrimSuffix(s, "B")
+	}
+	f, err := strconv.ParseFloat(strings.ReplaceAll(num, ",", ""), 64)
+	if err != nil {
+		return 0
+	}
+	return f * mult
+}
+
+func parseETA(s string) time.Duration {
+	parts := strings.Split(s, ":")
+	if len(parts) < 2 || len(parts) > 3 {
+		return 0
+	}
+	var h, m, sec int
+	if len(parts) == 3 {
+		h, _ = strconv.Atoi(parts[0])
+		m, _ = strconv.Atoi(parts[1])
+		sec, _ = strconv.Atoi(parts[2])
+	} else {
+		m, _ = strconv.Atoi(parts[0])
+		sec, _ = strconv.Atoi(parts[1])
+	}
+	if m < 0 || sec < 0 || h < 0 {
+		return 0
+	}
+	return time.Duration(h)*time.Hour + time.Duration(m)*time.Minute + time.Duration(sec)*time.Second
+}
+
+func parseRsyncProgress(line string) (done int64, pct float64, bps float64, eta time.Duration, ok bool) {
+	m := rsyncProgRe.FindStringSubmatch(line)
+	if m == nil {
+		return 0, 0, 0, 0, false
+	}
+	done, _ = strconv.ParseInt(strings.ReplaceAll(m[1], ",", ""), 10, 64)
+	p, _ := strconv.ParseFloat(m[2], 64)
+	return done, p, parseSpeed(m[3]), parseETA(m[4]), true
+}
+
 func cmdMove(o Options, appid, targetInput string) error {
+	return moveWithContext(context.Background(), o, appid, targetInput, nil)
+}
+
+func moveWithContext(ctx context.Context, o Options, appid, targetInput string, prog func(MoveProgress)) error {
 	if !validAppID(appid) {
 		return fmt.Errorf("invalid appid: %s", appid)
 	}
@@ -567,19 +645,60 @@ func cmdMove(o Options, appid, targetInput string) error {
 	_ = os.MkdirAll(filepath.Join(target, "steamapps", "common"), 0o755)
 	if _, err := os.Stat(srcCommon); err == nil {
 		if _, err := exec.LookPath("rsync"); err == nil {
-			args := []string{"-aH"}
-			if !o.Quiet {
-				args = append(args, "--info=progress2")
+			total := dirSize(srcCommon)
+			args := []string{"-aH", "--info=progress2", srcCommon + "/", dstCommon + "/"}
+			fmt.Printf("[steam-ctl] Copying %s -> %s (rsync, %s)...\n", installdir, target, humanSize(total))
+			cmd := exec.CommandContext(ctx, "rsync", args...)
+			stderr, err := cmd.StderrPipe()
+			if err != nil {
+				return fmt.Errorf("rsync pipe: %w", err)
 			}
-			args = append(args, srcCommon+"/", dstCommon+"/")
-			fmt.Printf("[steam-ctl] Copying %s -> %s (rsync)...\n", installdir, target)
-			cmd := exec.Command("rsync", args...)
 			if !o.Quiet {
 				cmd.Stdout = os.Stdout
-				cmd.Stderr = os.Stderr
 			}
-			if err := cmd.Run(); err != nil {
-				return fmt.Errorf("rsync failed: %w", err)
+			if err := cmd.Start(); err != nil {
+				if ctx.Err() != nil {
+					_ = os.RemoveAll(dstCommon)
+					return fmt.Errorf("cancelled")
+				}
+				return fmt.Errorf("rsync start: %w", err)
+			}
+			// Parse progress2 lines off stderr. Always consumed (even when
+			// Quiet) so rsync never blocks; forwarded to the prog callback
+			// and echoed for CLI runs.
+			doneCh := make(chan struct{})
+			go func() {
+				defer close(doneCh)
+				sc := bufio.NewScanner(stderr)
+				sc.Buffer(make([]byte, 64*1024), 64*1024)
+				for sc.Scan() {
+					line := sc.Text()
+					if d, _, bps, eta, ok := parseRsyncProgress(line); ok {
+						if prog != nil {
+							prog(MoveProgress{Done: d, Total: total, SpeedBps: bps, ETA: eta})
+						}
+						if !o.Quiet {
+							fmt.Fprintf(os.Stderr, "\r%-78s", line)
+						}
+					} else if !o.Quiet {
+						_, _ = io.WriteString(os.Stderr, line+"\n")
+					}
+				}
+			}()
+			runErr := cmd.Wait()
+			<-doneCh
+			if !o.Quiet {
+				fmt.Fprintln(os.Stderr)
+			}
+			if runErr != nil {
+				if ctx.Err() != nil {
+					_ = os.RemoveAll(dstCommon)
+					return fmt.Errorf("cancelled — source left intact, partial target removed")
+				}
+				return fmt.Errorf("rsync failed: %w", runErr)
+			}
+			if prog != nil {
+				prog(MoveProgress{Done: total, Total: total})
 			}
 			s1, s2 := dirSize(srcCommon), dirSize(dstCommon)
 			if s1 != s2 {
