@@ -125,9 +125,17 @@ func runTUI(o Options, mode string, preselect []string) error {
 			m.screen = scPick
 		}
 	}
-	p := tea.NewProgram(m, tea.WithAltScreen())
+	// Render straight to /dev/tty: op workers silence os.Stdout/os.Stderr
+	// while a copy runs, and Bubble Tea renders on stderr by default —
+	// without this the run screen would freeze mid-move.
+	tty, err := os.OpenFile("/dev/tty", os.O_WRONLY, 0)
+	if err != nil {
+		return err
+	}
+	defer tty.Close()
+	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithOutput(tty))
 	m.prog = p
-	_, err := p.Run()
+	_, err = p.Run()
 	return err
 }
 

@@ -2,9 +2,9 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -536,6 +536,18 @@ func parseRsyncProgress(line string) (done int64, pct float64, bps float64, eta 
 	return done, p, parseSpeed(m[3]), parseETA(m[4]), true
 }
 
+// splitProgressChunk splits rsync --info=progress2 output, which separates
+// live updates with \r (and the final summary with \n).
+func splitProgressChunk(data []byte, atEOF bool) (advance int, token []byte, err error) {
+	if i := bytes.IndexAny(data, "\r\n"); i >= 0 {
+		return i + 1, data[:i], nil
+	}
+	if atEOF && len(data) > 0 {
+		return len(data), data, nil
+	}
+	return 0, nil, nil
+}
+
 func cmdMove(o Options, appid, targetInput string) error {
 	return moveWithContext(context.Background(), o, appid, targetInput, nil)
 }
@@ -649,12 +661,14 @@ func moveWithContext(ctx context.Context, o Options, appid, targetInput string, 
 			args := []string{"-aH", "--info=progress2", srcCommon + "/", dstCommon + "/"}
 			fmt.Printf("[steam-ctl] Copying %s -> %s (rsync, %s)...\n", installdir, target, humanSize(total))
 			cmd := exec.CommandContext(ctx, "rsync", args...)
-			stderr, err := cmd.StderrPipe()
+			// NB: rsync writes --info=progress2 updates to STDOUT
+			// (as \r-separated chunks), not stderr.
+			stdout, err := cmd.StdoutPipe()
 			if err != nil {
 				return fmt.Errorf("rsync pipe: %w", err)
 			}
 			if !o.Quiet {
-				cmd.Stdout = os.Stdout
+				cmd.Stderr = os.Stderr
 			}
 			if err := cmd.Start(); err != nil {
 				if ctx.Err() != nil {
@@ -663,16 +677,20 @@ func moveWithContext(ctx context.Context, o Options, appid, targetInput string, 
 				}
 				return fmt.Errorf("rsync start: %w", err)
 			}
-			// Parse progress2 lines off stderr. Always consumed (even when
+			// Parse progress2 chunks off stdout. Always consumed (even when
 			// Quiet) so rsync never blocks; forwarded to the prog callback
 			// and echoed for CLI runs.
 			doneCh := make(chan struct{})
 			go func() {
 				defer close(doneCh)
-				sc := bufio.NewScanner(stderr)
+				sc := bufio.NewScanner(stdout)
+				sc.Split(splitProgressChunk)
 				sc.Buffer(make([]byte, 64*1024), 64*1024)
 				for sc.Scan() {
-					line := sc.Text()
+					line := strings.TrimSpace(sc.Text())
+					if line == "" {
+						continue
+					}
 					if d, _, bps, eta, ok := parseRsyncProgress(line); ok {
 						if prog != nil {
 							prog(MoveProgress{Done: d, Total: total, SpeedBps: bps, ETA: eta})
@@ -680,8 +698,6 @@ func moveWithContext(ctx context.Context, o Options, appid, targetInput string, 
 						if !o.Quiet {
 							fmt.Fprintf(os.Stderr, "\r%-78s", line)
 						}
-					} else if !o.Quiet {
-						_, _ = io.WriteString(os.Stderr, line+"\n")
 					}
 				}
 			}()
